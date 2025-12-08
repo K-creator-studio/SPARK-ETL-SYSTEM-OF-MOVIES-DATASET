@@ -1,0 +1,132 @@
+""" 
+Optimized Airflow DAG for Kaggle -> Spark ETL.
+Place this file under: <AIRFLOW_HOME>/dags/kaggle_ingestion_dag.py
+"""
+from datetime import datetime, timedelta
+import os
+import subprocess
+from pathlib import Path
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.sensors.filesystem import FileSensor
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.hooks.base import BaseHook
+
+
+# ---- DAG defaults ----
+default_args = {
+"owner": "kiran",
+"depends_on_past": False,
+"retries": 2, 
+"retry_delay": timedelta(minutes=2),
+"email_on_failure": False,
+"email_on_retry": False,
+}  
+
+
+# Where to store downloaded data (worker-local)
+DOWNLOAD_DIR = "/tmp/kaggle_data"
+SUCCESS_MARKER = os.path.join(DOWNLOAD_DIR, "_DOWNLOAD_SUCCESS")
+PARQUET_OUTPUT = "/tmp/kaggle_data_parquet"
+
+with DAG(
+dag_id="kaggle_direct_ingestion_optimized",
+default_args=default_args,
+start_date=datetime(2025, 1, 1),
+schedule_interval=None,
+catchup=False,
+max_active_runs=1,
+tags=["kaggle", "spark", "etl"],
+
+) as dag:
+
+def download_from_kaggle(**context):    
+"""
+Downloads dataset via kaggle CLI using Airflow connection 'kaggle_api'.
+Writes a _DOWNLOAD_SUCCESS marker file when complete.
+Returns the download_path (XCom pushed automatically by return).
+"""
+# Get creds from Airflow connection
+conn = BaseHook.get_connection("kaggle_api")
+kaggle_username = conn.login
+kaggle_key = conn.password
+if not kaggle_username or not kaggle_key:
+raise ValueError("kaggle_api connection must contain login and password (key).")
+os.environ["KAGGLE_USERNAME"] = kaggle_username
+os.environ["KAGGLE_KEY"] = kaggle_key
+dataset = context.get("params", {}).get(
+"dataset", "pankajmaulekhi/tmdb-top-10000-movies-updated-till-2025"
+)   
+
+download_path = DOWNLOAD_DIR
+Path(download_path).mkdir(parents=True, exist_ok=True)
+cmd = [
+"kaggle",
+"datasets",
+"download",
+"-d",
+dataset,
+"-p",
+download_path,
+"--unzip",
+"--force"  # idempotent: overwrite existing files
+]
+
+
+# Run kaggle CLI and capture output
+result = subprocess.run(cmd, capture_output=True, text=True)
+if result.returncode != 0:
+raise Exception(f"Kaggle download failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}") 
+# write marker file to signal success to sensors/operators
+with open(SUCCESS_MARKER, "w") as f:
+f.write("OK") 
+# return paths for XComs
+return { 
+"download_path": download_path, 
+"success_marker": SUCCESS_MARKER,
+"parquet_output": PARQUET_OUTPUT 
+}
+
+download_task = PythonOperator(
+task_id="download_kaggle_dataset",
+python_callable=download_from_kaggle,
+provide_context=True,
+params={"dataset": "pankajmaulekhi/tmdb-top-10000-movies-updated-till-2025"},
+)
+wait_for_download = FileSensor(
+task_id="wait_for_kaggle_download_marker",
+filepath=SUCCESS_MARKER,
+fs_conn_id="fs_default", 
+# default filesystem (worker local) 
+poke_interval=10,
+timeout=60 * 10,  
+# 10 minutes
+mode="poke",  
+)
+
+# SparkSubmitOperator - executes external spark ETL script   
+spark_etl_submit = SparkSubmitOperator(
+task_id="spark_etl_submit",
+application="/home/kf498/airflow/dags/spark_jobs/spark_ETL.py",  
+name="spark_kaggle_etl",
+conn_id="spark_default",
+verbose=True,
+application_args=[],
+driver_memory="4g",
+executor_memory="4g",
+executor_cores=2,
+num_executors=2 
+)
+download_task >> wait_for_download >> spark_etl_submit   
+
+
+
+
+
+
+
+
+
+
+
+

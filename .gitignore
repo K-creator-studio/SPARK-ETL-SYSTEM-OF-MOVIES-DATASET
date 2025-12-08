@@ -1,0 +1,16 @@
+# Python virtual environments
+.venv/
+env/
+venv/
+
+# Data files
+*.csv
+*.parquet
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Spark / logs
+derby.log
+metastore_db/
